@@ -272,6 +272,7 @@ struct server_slot {
     int64_t t_last_used = -1;
 
     bool inference_paused = false;
+    bool maintenance_yield = false;
     bool scheduler_paused = false;
     int64_t scheduler_last_progress = 0;
     int64_t scheduler_suspensions = 0;
@@ -504,6 +505,7 @@ struct server_slot {
 
         update_pause_clock(ggml_time_us(), true);
         inference_paused = false;
+        maintenance_yield = false;
         scheduler_paused = false;
         scheduler_last_progress = ggml_time_us();
         spec_is_replay = false;
@@ -2570,7 +2572,9 @@ private:
                     auto res = std::make_unique<server_task_result_control>();
                     res->id = task.id;
 
-                    server_slot * slot = get_slot_by_cmpl_id(task.params.control_cmpl_id);
+                    server_slot * slot = task.params.control_action == "yield_prefill" &&
+                        task.id_slot >= 0 && task.id_slot < (int) slots.size() ? &slots[task.id_slot] :
+                        get_slot_by_cmpl_id(task.params.control_cmpl_id);
                     if (slot == nullptr) {
                         SRV_WRN("control %s on unknown completion id=%s, no live slot\n",
                                 task.params.control_action.c_str(), task.params.control_cmpl_id.c_str());
@@ -2580,7 +2584,15 @@ private:
                         break;
                     }
 
-                    if (task.params.control_action == "pause" || task.params.control_action == "resume") {
+                    if (task.params.control_action == "yield_prefill") {
+                        if (slot->task && slot->task->params.cognitive_maintenance && slot->n_predict_max == 0) {
+                            slot->maintenance_yield = true;
+                            res->success = true;
+                        } else {
+                            res->success = false;
+                            res->message = "not prefill-only maintenance";
+                        }
+                    } else if (task.params.control_action == "pause" || task.params.control_action == "resume") {
                         slot->inference_paused = task.params.control_action == "pause";
                         res->success = true;
                     } else if (task.params.control_action == "reasoning_end") {
@@ -3075,8 +3087,8 @@ private:
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task &&
                 slot.task->params.cognitive_maintenance && slot.n_predict_max == 0 &&
                 slot.task->params.t_max_prompt_ms > 0 &&
-                slot.stats.t_elapsed_us() >= slot.task->params.t_max_prompt_ms * 1000 &&
-                slot.prompt.n_tokens() > slot.stats.n_prompt_cached) {
+                (slot.maintenance_yield || slot.stats.t_elapsed_us() >= slot.task->params.t_max_prompt_ms * 1000) &&
+                (uint64_t) slot.prompt.n_tokens() > slot.stats.n_prompt_cached) {
                 llama_synchronize(ctx_tgt);
                 slot.stats.update_prompt_last();
                 slot.stats.update_gen_last();
@@ -5197,11 +5209,12 @@ void server_routes::init_routes() {
 
         const std::string cmpl_id = json_value(body, "id", std::string());
         const std::string action  = json_value(body, "action", std::string());
-        if (cmpl_id.empty()) {
+        const int slot_id = json_value(body, "id_slot", -1);
+        if (cmpl_id.empty() && !(action == "yield_prefill" && slot_id >= 0)) {
             res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (action != "reasoning_end" && action != "pause" && action != "resume") {
+        if (action != "reasoning_end" && action != "pause" && action != "resume" && action != "yield_prefill") {
             res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -5210,6 +5223,7 @@ void server_routes::init_routes() {
         {
             server_task task(SERVER_TASK_TYPE_CONTROL);
             task.id              = rd.get_new_id();
+            task.id_slot = slot_id;
             task.params.control_cmpl_id = cmpl_id;
             task.params.control_action  = action;
             rd.post_task(std::move(task));
