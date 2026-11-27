@@ -391,7 +391,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
 
-    if (getenv("GGML_CUDA_P2P") != nullptr) {
+    // Enable peer access by default when the device pair supports it. On the
+    // T7910's dual-P100 PHB topology this avoids leaving validated direct
+    // peer paths behind an environment opt-in; unsupported pairs are skipped.
+    if (info.physical_device_count > 1) {
         for (int id = 0; id < info.physical_device_count; ++id) {
             CUDA_CHECK(cudaSetDevice(id));
             for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
@@ -606,7 +609,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemRelease(handle));
 
             // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
-            bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
+            bool use_peer_access = true;
 #if defined(GGML_USE_NCCL)
             use_peer_access = true;
 #endif // defined(GGML_USE_NCCL)
@@ -730,6 +733,13 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    half * prefill_act = nullptr;
+    size_t prefill_act_capacity = 0;
+    const ggml_tensor * prefill_act_src = nullptr;
+    const void * prefill_act_data = nullptr;
+    const ggml_backend_cuda_context * prefill_act_owner = nullptr;
+    uint64_t prefill_act_epoch = 0;
+    bool prefill_act_announced = false;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -737,6 +747,10 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        if (prefill_act != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(prefill_act));
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -778,6 +792,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ctx->prefill_act_src = nullptr;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
@@ -786,6 +801,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ctx->prefill_act_src = nullptr;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -803,6 +819,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ctx->prefill_act_src = nullptr;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -824,6 +841,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        dst_ctx->prefill_act_src = nullptr;
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
@@ -847,6 +865,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ctx->prefill_act_src = nullptr;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
@@ -967,6 +986,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 // (NCCL communicators or the internal AllReduce pipeline) are initialised
 // eagerly during comm_init so any init failure surfaces at startup rather
 // than mid-run.
+
 struct ggml_backend_cuda_comm_context {
     using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **);
 
@@ -1408,7 +1428,7 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 };
 
 template<ggml_type compute_type>
-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, typename batched_mul_mat_traits<compute_type>::cuda_type * fused_output = nullptr) {
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
@@ -1437,6 +1457,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     float * dst_ddf = (float *) dst->data;
 
+    bool src0_nn = false;
     const cuda_t * src0_ptr = nullptr;
     const cuda_t * src1_ptr = nullptr;
 
@@ -1452,13 +1473,29 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_alloc.alloc(ggml_nelements(src0));
 
         if (ggml_is_contiguously_allocated(src0)) {
-            const auto convert_func = traits::convert(src0->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
-            const size_t src0_bs = ggml_blck_size(src0->type);
-            s01 *= src0_bs;
-            s02 *= src0_bs;
-            s03 *= src0_bs;
+            if constexpr (compute_type == GGML_TYPE_F16) {
+                static const bool nn_enabled = [] {
+                    const char * value = getenv("GGML_CUDA_GP100_Q4K_NN");
+                    return !value || atoi(value) != 0;
+                }();
+                if (nn_enabled && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL &&
+                    src0->type == GGML_TYPE_Q4_K && ggml_is_contiguous(src0) &&
+                    ne00 == 5120 && ne01 == 8704 && ne02 == 1 && ne03 == 1 &&
+                    ne10 == 5120 && ne11 >= 2040 && ne11 <= 2048 && ne12 == 1 && ne13 == 1) {
+                    ggml_cuda_gp100_q4k_to_fp16_nn(src0->data, src0_alloc.get(), ne01, ne00, main_stream);
+                    src0_nn = true;
+                    s01 = ne01;
+                }
+            }
+            if (!src0_nn) {
+                const auto convert_func = traits::convert(src0->type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+                const size_t src0_bs = ggml_blck_size(src0->type);
+                s01 *= src0_bs;
+                s02 *= src0_bs;
+                s03 *= src0_bs;
+            }
         } else {
             const auto convert_func = traits::convert_nc(src0->type);
             GGML_ASSERT(convert_func != nullptr);
@@ -1474,12 +1511,55 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
-        src1_alloc.alloc(ggml_nelements(src1));
+        cuda_t * converted = nullptr;
+        bool act_hit = false;
+        if constexpr (compute_type == GGML_TYPE_F16) {
+            static const bool act_cache_enabled = [] {
+                const char * value = getenv("GGML_CUDA_GP100_PREFILL_ACT_CACHE");
+                return value && atoi(value) != 0;
+            }();
+            ggml_backend_buffer_t buffer = src1->buffer;
+            if (buffer == nullptr && src1->view_src != nullptr) {
+                buffer = src1->view_src->buffer;
+            }
+            if (act_cache_enabled && ctx.curr_stream_no == 0 &&
+                ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL &&
+                ne01 == 8704 && ne10 == 5120 && ne11 >= 128 && ne11 <= 8192 &&
+                ne12 == 1 && ne13 == 1 && src1->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(src1) && buffer != nullptr && ggml_backend_buffer_is_cuda(buffer) &&
+                static_cast<ggml_backend_cuda_buffer_context *>(buffer->context)->device == ctx.device &&
+                (src1->op == GGML_OP_MUL || src1->op == GGML_OP_RMS_NORM)) {
+                auto * bctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+                const size_t bytes = ggml_nelements(src1) * sizeof(half);
+                if (bctx->prefill_act_capacity < bytes) {
+                    CUDA_CHECK(cudaFree(bctx->prefill_act));
+                    CUDA_CHECK(cudaMalloc(&bctx->prefill_act, bytes));
+                    bctx->prefill_act_capacity = bytes;
+                    bctx->prefill_act_src = nullptr;
+                }
+                act_hit = bctx->prefill_act_src == src1 && bctx->prefill_act_data == src1->data &&
+                    bctx->prefill_act_owner == &ctx && bctx->prefill_act_epoch == ctx.graph_epoch;
+                bctx->prefill_act_src = src1;
+                bctx->prefill_act_data = src1->data;
+                bctx->prefill_act_owner = &ctx;
+                bctx->prefill_act_epoch = ctx.graph_epoch;
+                converted = bctx->prefill_act;
+                if (act_hit && !bctx->prefill_act_announced) {
+                    GGML_LOG_WARN("P100 prefill activation cache hit: n=%lld k=%lld\n", (long long) ne11, (long long) ne10);
+                    bctx->prefill_act_announced = true;
+                }
+            }
+        }
+        if (converted == nullptr) {
+            converted = src1_alloc.alloc(ggml_nelements(src1));
+        }
 
         if (ggml_is_contiguously_allocated(src1)) {
             const auto convert_func = traits::convert(src1->type);
             GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+            if (!act_hit) {
+                convert_func(src1->data, converted, ggml_nelements(src1), main_stream);
+            }
             const size_t src1_bs = ggml_blck_size(src1->type);
             s11 *= src1_bs;
             s12 *= src1_bs;
@@ -1487,13 +1567,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         } else {
             const auto convert_func = traits::convert_nc(src1->type);
             GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            convert_func(src1->data, converted, ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
             s11 = ne10;
             s12 = ne11*s11;
             s13 = ne12*s12;
             is_src1_cont_2 = true;
         }
-        src1_ptr = src1_alloc.get();
+        src1_ptr = converted;
     }
 
     ggml_cuda_pool_alloc<cuda_t> dst_temp(ctx.pool());
@@ -1516,6 +1596,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
 
+    GGML_ASSERT(fused_output == nullptr || (compute_type == GGML_TYPE_F16 && !prefer_f32_output));
     if (prefer_f32_output) {
         dst_ptr = (char *) dst_ddf;
         cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
@@ -1526,7 +1607,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if constexpr (compute_type == GGML_TYPE_F32) {
             dst_ptr = (char *) dst_ddf;  // Direct F32 output
         } else {
-            dst_ptr = (char *) dst_temp.alloc(ne_dst);
+            dst_ptr = (char *) (fused_output != nullptr ? fused_output : dst_temp.alloc(ne_dst));
             nbd2 /= sizeof(float) / sizeof(cuda_t);
             nbd3 /= sizeof(float) / sizeof(cuda_t);
         }
@@ -1538,6 +1619,30 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // broadcast factors
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
+    // GP100's cuBLAS default algorithm is slower for these full-prefill
+    // projection shapes. Keep this narrowly limited to half-precision
+    // single-matrix GEMMs on Pascal P100; all other shapes retain the
+    // library default. The selected algorithms were measured on dual P100.
+    const bool p100_fp16_gemm = cc == GGML_CUDA_CC_PASCAL &&
+        cu_compute_type == CUBLAS_COMPUTE_16F && cu_data_type_a == CUDA_R_16F &&
+        cu_data_type_b == CUDA_R_16F && cu_data_type == CUDA_R_16F;
+    const bool matched_2048 = ne11 >= 2040 && ne11 <= 2048 &&
+        ((ne01 == 8704 && ne10 == 5120) ||
+         (ne01 == 5120 && ne10 == 8704) ||
+         (ne01 == 5120 && ne10 == 5120) ||
+         (ne01 == 5120 && ne10 == 3072) ||
+         (ne01 == 3072 && ne10 == 5120) ||
+         (ne01 == 512 && ne10 == 5120) ||
+         (ne01 == 24 && ne10 == 5120));
+    const bool matched_4096 = ne11 >= 4080 && ne11 <= 4096 &&
+        ((ne01 == 5120 && ne10 == 8704) ||
+         (ne01 == 6144 && ne10 == 5120) ||
+         (ne01 == 5120 && ne10 == 5120) ||
+         (ne01 == 5120 && ne10 == 3072) ||
+         (ne01 == 24 && ne10 == 5120));
+    const cublasGemmAlgo_t gemm_algo = p100_fp16_gemm && (matched_2048 || matched_4096)
+        ? ((ne01 == 512 || ne01 == 24) ? CUBLAS_GEMM_ALGO5 : CUBLAS_GEMM_ALGO3)
+        : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
 
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
@@ -1551,13 +1656,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                     (const float *) beta,  (float       *)  dst_ptr, ne0));
     } else if (ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
-            cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+            cublasGemmEx(cublas_h, src0_nn ? CUBLAS_OP_N : CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
                     alpha, src0_ptr, cu_data_type_a, s01,
                            src1_ptr, cu_data_type_b, s11,
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    gemm_algo));
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
@@ -1615,7 +1720,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 
     // Convert output back to F32 if needed
-    if (cu_data_type != CUDA_R_32F) {
+    if (cu_data_type != CUDA_R_32F && fused_output == nullptr) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
     }
@@ -1755,6 +1860,79 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    return true;
+}
+
+
+// Retain the GEMMs' existing F16 rounding and consume their outputs directly.
+// The caller proves that the two F32 intermediate tensors have no consumers
+// outside this three-node fusion and that the output cannot alias its inputs.
+static __global__ void ggml_cuda_gp100_prefill_glu_kernel(
+        const half * gate, const half * up, float * dst, int64_t count) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const float x = __half2float(gate[i]);
+        const float y = __half2float(up[i]);
+        dst[i] = ggml_cuda_op_silu_single(x) * y;
+    }
+}
+
+static bool ggml_cuda_gp100_fuse_prefill_ffn(
+        ggml_backend_cuda_context & ctx, ggml_tensor * gate,
+        ggml_tensor * up, ggml_tensor * glu) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_GP100_PREFILL_FFN_FUSION");
+        return !value || atoi(value) != 0;
+    }();
+    if (!enabled || ctx.curr_stream_no != 0 ||
+        ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_PASCAL ||
+        gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        gate->op_params[0] == GGML_PREC_F32 || up->op_params[0] == GGML_PREC_F32 ||
+        getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE") != nullptr) return false;
+    const ggml_tensor * activation = up->src[1];
+    if (gate->src[1] != activation || activation->type != GGML_TYPE_F32 ||
+        activation->ne[0] != 5120 || activation->ne[1] < 128 || activation->ne[1] > 8192 ||
+        activation->ne[2] != 1 || activation->ne[3] != 1 ||
+        up->ne[0] != 8704 || gate->ne[0] != 8704 ||
+        gate->src[0]->type != GGML_TYPE_Q4_K || up->src[0]->type != GGML_TYPE_Q4_K ||
+        !ggml_are_same_shape(gate, up) || !ggml_are_same_shape(gate, glu) ||
+        gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(activation) || !ggml_is_contiguous(gate->src[0]) ||
+        !ggml_is_contiguous(up->src[0]) || !ggml_is_contiguous(gate) ||
+        !ggml_is_contiguous(up) || !ggml_is_contiguous(glu)) return false;
+    for (const ggml_tensor * tensor : std::array<const ggml_tensor *, 4>{activation, gate->src[0], up->src[0], glu}) {
+        ggml_backend_buffer_t buffer = tensor->buffer;
+        if (buffer == nullptr && tensor->view_src != nullptr) buffer = tensor->view_src->buffer;
+        if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer) ||
+            static_cast<ggml_backend_cuda_buffer_context *>(buffer->context)->device != ctx.device) return false;
+    }
+    {
+        const uintptr_t out_begin = reinterpret_cast<uintptr_t>(glu->data);
+        const uintptr_t out_end = out_begin + ggml_nbytes(glu);
+        const size_t input_bytes = ggml_nelements(gate) * sizeof(half);
+        const uintptr_t gate_begin = reinterpret_cast<uintptr_t>(gate->data);
+        const uintptr_t up_begin = reinterpret_cast<uintptr_t>(up->data);
+        if ((out_begin < gate_begin + input_bytes && gate_begin < out_end) ||
+            (out_begin < up_begin + input_bytes && up_begin < out_end) ||
+            (gate_begin < up_begin + input_bytes && up_begin < gate_begin + input_bytes)) return false;
+    }
+    ggml_cuda_pool_alloc<half> converted(ctx.pool(), ggml_nelements(activation));
+    half * gate_ptr = static_cast<half *>(gate->data);
+    half * up_ptr = static_cast<half *>(up->data);
+    ggml_get_to_fp16_cuda(GGML_TYPE_F32)(activation->data, converted.get(), ggml_nelements(activation), ctx.stream());
+    ggml_tensor local_activation = *activation;
+    local_activation.type = GGML_TYPE_F16;
+    local_activation.data = converted.get();
+    for (size_t & stride : local_activation.nb) stride /= 2;
+    ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, gate->src[0], &local_activation, gate, gate_ptr);
+    ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, up->src[0], &local_activation, up, up_ptr);
+    const int64_t count = ggml_nelements(glu);
+    ggml_cuda_gp100_prefill_glu_kernel<<<(count + 255) / 256, 256, 0, ctx.stream()>>>(
+        gate_ptr, up_ptr, static_cast<float *>(glu->data), count);
+    CUDA_CHECK(cudaGetLastError());
+    static bool announced = false;
+    if (!announced) { GGML_LOG_WARN("P100 local prefill FFN fusion with elided storage: n=%lld\n", (long long) activation->ne[1]); announced = true; }
     return true;
 }
 
@@ -4261,6 +4439,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src0 = up->src[0];
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
+
+            if (op == GGML_OP_MUL_MAT && up->ne[1] >= 128 &&
+                ggml_cuda_gp100_fuse_prefill_ffn(*cuda_ctx, gate, up, glu)) {
+                fused_mul_mat_vec = true;
+                fused_node_count = 3;
+                break;
+            }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};

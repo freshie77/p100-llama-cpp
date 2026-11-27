@@ -159,6 +159,70 @@ static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t
     dequantize_q4_K(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
+// Preserve each scalar F32 expression and F16 rounding, but combine stores.
+static __device__ __forceinline__ uint32_t gp100_q4k_pair(
+        uint32_t q, int shift, float d, float m) {
+    const half a = ggml_cuda_cast<half>(d * ((q >> shift) & 0xF) - m);
+    const half b = ggml_cuda_cast<half>(d * ((q >> (shift + 8)) & 0xF) - m);
+    return static_cast<uint32_t>(__half_as_ushort(a)) |
+        (static_cast<uint32_t>(__half_as_ushort(b)) << 16);
+}
+
+static __global__ void gp100_dequantize_q4_K_vector(
+        const void * __restrict__ vx, half * __restrict__ yy, int nb) {
+    const int64_t ib = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+    if (ib >= nb) return;
+    const auto * x = static_cast<const block_q4_K *>(vx);
+    const int tid = threadIdx.x % 32, il = tid / 8, ir = tid % 8;
+    half * y = yy + ib * QK_K + 64 * il + 4 * ir;
+    const float dall = __low2half(x[ib].dm), dmin = __high2half(x[ib].dm);
+    uint8_t sc, m;
+    get_scale_min_k4(2 * il, x[ib].scales, sc, m);
+    const float d1 = dall * sc, m1 = dmin * m;
+    get_scale_min_k4(2 * il + 1, x[ib].scales, sc, m);
+    const float d2 = dall * sc, m2 = dmin * m;
+    const uint32_t q = *reinterpret_cast<const uint32_t *>(x[ib].qs + 32 * il + 4 * ir);
+    const uint2 low = make_uint2(gp100_q4k_pair(q, 0, d1, m1), gp100_q4k_pair(q, 16, d1, m1));
+    const uint2 high = make_uint2(gp100_q4k_pair(q, 4, d2, m2), gp100_q4k_pair(q, 20, d2, m2));
+    *reinterpret_cast<uint2 *>(y) = low;
+    *reinterpret_cast<uint2 *>(y + 32) = high;
+}
+
+// Draft: use the retained scalar math and half rounding, then transpose
+// through shared memory directly to the NN cuBLAS weight layout.
+static __global__ void gp100_dequantize_q4_K_nn(
+        const block_q4_K * __restrict__ x, half * __restrict__ y, int m, int k) {
+    __shared__ __align__(8) half tile[16][260];
+    const int row_local = threadIdx.x / 32;
+    const int tid = threadIdx.x % 32, il = tid / 8, ir = tid % 8;
+    const int row = 16 * blockIdx.x + row_local;
+    const int ib = row * (k / QK_K) + blockIdx.y;
+    const float dall = __low2half(x[ib].dm), dmin = __high2half(x[ib].dm);
+    uint8_t sc, min;
+    get_scale_min_k4(2 * il, x[ib].scales, sc, min);
+    const float d1 = dall * sc, m1 = dmin * min;
+    get_scale_min_k4(2 * il + 1, x[ib].scales, sc, min);
+    const float d2 = dall * sc, m2 = dmin * min;
+    const uint32_t q = *reinterpret_cast<const uint32_t *>(x[ib].qs + 32 * il + 4 * ir);
+    half * out = tile[row_local] + 64 * il + 4 * ir;
+    *reinterpret_cast<uint2 *>(out) = make_uint2(gp100_q4k_pair(q,0,d1,m1), gp100_q4k_pair(q,16,d1,m1));
+    *reinterpret_cast<uint2 *>(out+32) = make_uint2(gp100_q4k_pair(q,4,d2,m2), gp100_q4k_pair(q,20,d2,m2));
+    __syncthreads();
+    for (int i = threadIdx.x; i < 16 * 256 / 2; i += blockDim.x) {
+        const int pair = i % 8, col = i / 8;
+        const uint32_t bits = uint32_t(__half_as_ushort(tile[2*pair][col])) |
+            (uint32_t(__half_as_ushort(tile[2*pair+1][col])) << 16);
+        *reinterpret_cast<uint32_t *>(y + (256 * blockIdx.y + col) * m + 16 * blockIdx.x + 2 * pair) = bits;
+    }
+}
+
+
+void ggml_cuda_gp100_q4k_to_fp16_nn(const void * vx, half * y, int m, int k, cudaStream_t stream) {
+    GGML_ASSERT(m > 0 && m % 16 == 0 && k > 0 && k % QK_K == 0);
+    GGML_ASSERT(ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_PASCAL);
+    gp100_dequantize_q4_K_nn<<<dim3(m / 16, k / QK_K), 512, 0, stream>>>(static_cast<const block_q4_K *>(vx), y, m, k);
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
@@ -171,6 +235,54 @@ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
     const int64_t i = blockIdx.x;
 
     dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
+}
+
+static __device__ __forceinline__ uint32_t gp100_q6k_pair(
+        uint32_t ql, uint32_t qh, int low_shift, int high_shift, float ds) {
+    const int a = static_cast<int8_t>(((ql >> low_shift) & 15) | (((qh >> high_shift) & 3) << 4)) - 32;
+    const int b = static_cast<int8_t>(((ql >> (low_shift + 8)) & 15) | (((qh >> (high_shift + 8)) & 3) << 4)) - 32;
+    const half va = ggml_cuda_cast<half>(ds * a);
+    const half vb = ggml_cuda_cast<half>(ds * b);
+    return static_cast<uint32_t>(__half_as_ushort(va)) | (static_cast<uint32_t>(__half_as_ushort(vb)) << 16);
+}
+
+// Q6_K blocks are 210 bytes, so input words have only two-byte alignment.
+// Preserve scalar arithmetic while writing four adjacent halves together.
+static __global__ void gp100_dequantize_q6_K_vector(
+        const void * __restrict__ vx, half * __restrict__ yy, int nb) {
+    const int64_t ib = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 64) + threadIdx.x / 64;
+    if (ib >= nb) return;
+    const auto * x = static_cast<const block_q6_K *>(vx);
+    const int tid = threadIdx.x % 64, ip = tid / 32, section = (tid % 32) / 8, il = (tid % 8) * 4;
+    const auto * lo = reinterpret_cast<const uint16_t *>(x[ib].ql + ip * 64 + (section % 2) * 32 + il);
+    const auto * hi = reinterpret_cast<const uint16_t *>(x[ib].qh + ip * 32 + il);
+    const uint32_t ql = static_cast<uint32_t>(lo[0]) | (static_cast<uint32_t>(lo[1]) << 16);
+    const uint32_t qh = static_cast<uint32_t>(hi[0]) | (static_cast<uint32_t>(hi[1]) << 16);
+    const float ds = static_cast<float>(x[ib].d) * x[ib].scales[8 * ip + 2 * section + il / 16];
+    const int ls = section >= 2 ? 4 : 0, hs = 2 * section;
+    const uint2 values = make_uint2(gp100_q6k_pair(ql, qh, ls, hs, ds), gp100_q6k_pair(ql, qh, ls + 16, hs + 16, ds));
+    *reinterpret_cast<uint2 *>(yy + ib * QK_K + ip * 128 + section * 32 + il) = values;
+}
+
+// One warp owns a block, reusing each input word for its low/high nibbles.
+static __global__ void gp100_dequantize_q6_K_vector32(
+        const void * __restrict__ vx, half * __restrict__ yy, int nb) {
+    const int64_t ib = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+    if (ib >= nb) return;
+    const auto * x = static_cast<const block_q6_K *>(vx);
+    const int tid = threadIdx.x % 32, ip = tid / 16, section = (tid % 16) / 8, il = (tid % 8) * 4;
+    const auto * lo = reinterpret_cast<const uint16_t *>(x[ib].ql + ip * 64 + section * 32 + il);
+    const auto * hi = reinterpret_cast<const uint16_t *>(x[ib].qh + ip * 32 + il);
+    const uint32_t ql = static_cast<uint32_t>(lo[0]) | (static_cast<uint32_t>(lo[1]) << 16);
+    const uint32_t qh = static_cast<uint32_t>(hi[0]) | (static_cast<uint32_t>(hi[1]) << 16);
+    const float d = static_cast<float>(x[ib].d);
+    const int sc = 8 * ip + 2 * section + il / 16, hs = 2 * section;
+    const float ds_low = d * x[ib].scales[sc], ds_high = d * x[ib].scales[sc + 4];
+    const uint2 low = make_uint2(gp100_q6k_pair(ql, qh, 0, hs, ds_low), gp100_q6k_pair(ql, qh, 16, hs + 16, ds_low));
+    const uint2 high = make_uint2(gp100_q6k_pair(ql, qh, 4, hs + 4, ds_high), gp100_q6k_pair(ql, qh, 20, hs + 20, ds_high));
+    half * y = yy + ib * QK_K + ip * 128 + section * 32 + il;
+    *reinterpret_cast<uint2 *>(y) = low;
+    *reinterpret_cast<uint2 *>(y + 64) = high;
 }
 
 template<typename dst_t>
@@ -299,6 +411,23 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same<dst_t, half>::value) {
+        static const int packed_blocks = [] {
+            const char * value = getenv("GGML_CUDA_GP100_Q4K_BLOCKS");
+            return value ? atoi(value) : 8;
+        }();
+        if (nb >= 4096 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_PASCAL &&
+            (packed_blocks == 2 || packed_blocks == 4 || packed_blocks == 8 || packed_blocks == 16)) {
+            static const bool vector_stores = [] {
+                const char * value = getenv("GGML_CUDA_GP100_Q4K_VECTOR");
+                return !value || atoi(value) != 0;
+            }();
+            if (vector_stores) {
+                gp100_dequantize_q4_K_vector<<<(nb + packed_blocks - 1) / packed_blocks, 32 * packed_blocks, 0, stream>>>(vx, y, nb);
+                return;
+            }
+        }
+    }
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -311,6 +440,25 @@ static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same<dst_t, half>::value) {
+        static const int vector_stores = [] {
+            const char * value = getenv("GGML_CUDA_GP100_Q6K_VECTOR");
+            return value ? atoi(value) : 0;
+        }();
+        static const int packed_blocks = [] {
+            const char * value = getenv("GGML_CUDA_GP100_Q6K_BLOCKS");
+            return value ? atoi(value) : 4;
+        }();
+        if (vector_stores && nb >= 4096 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_PASCAL &&
+            (packed_blocks == 1 || packed_blocks == 2 || packed_blocks == 4 || packed_blocks == 8 || packed_blocks == 16)) {
+            if (vector_stores == 2) {
+                gp100_dequantize_q6_K_vector32<<<(nb + packed_blocks - 1) / packed_blocks, 32 * packed_blocks, 0, stream>>>(vx, y, nb);
+            } else {
+                gp100_dequantize_q6_K_vector<<<(nb + packed_blocks - 1) / packed_blocks, 64 * packed_blocks, 0, stream>>>(vx, y, nb);
+            }
+            return;
+        }
+    }
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 

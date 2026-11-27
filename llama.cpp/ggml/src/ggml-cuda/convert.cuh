@@ -12,6 +12,8 @@ typedef to_t_cuda_t<nv_bfloat16> to_bf16_cuda_t;
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type);
 
+void ggml_cuda_gp100_q4k_to_fp16_nn(const void * x, half * y, int m, int k, cudaStream_t stream);
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);

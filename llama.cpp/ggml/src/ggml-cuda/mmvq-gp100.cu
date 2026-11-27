@@ -1234,7 +1234,11 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void * 
             }
             GGML_ABORT("IQ4_NL supports at most 4 rows per warp");
         case GGML_TYPE_Q6_K:
-            if constexpr (R <= 8) {
+            // Q6_K GLU stages both matrices: R=8 would reserve 56 KiB,
+            // exceeding sm_60's 48 KiB per-block static shared-memory limit.
+            // Runtime mapping already caps GLU at R=2; don't instantiate
+            // the unreachable R=8 GLU specialization on CUDA 12.9.
+            if constexpr (R <= (GLU ? 4 : 8)) {
                 GP100_LAUNCH((gp100_mmvq_q6_K<R, GLU>));
                 break;
             }

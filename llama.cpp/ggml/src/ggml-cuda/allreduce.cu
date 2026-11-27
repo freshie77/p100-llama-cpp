@@ -287,8 +287,9 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // lockstep guarantees the GPUs are at most one AR (or chunk) apart, so
 // slot[N%2] is always safe to reuse -- every peer has already consumed
 // slot[N%2] from AR N-2 by the time we get to AR N.  acquire_slot's
-// cudaEventSynchronize on ev.ker for every device makes that consumption
-// explicit before we overwrite host_buf[slot] for the new AR.
+// waits on ev.ker for every device make that consumption explicit before
+// overwriting ring resources. Large exchanges can opt into device waits;
+// small exchanges retain host waits to preserve decode latency.
 static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 
 // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
@@ -423,15 +424,28 @@ struct ggml_cuda_ar_slot_info {
     int token;
 };
 
-static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
+static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends, bool copy_engine) {
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
 
     if (pool_lapped) {
+        static const uint64_t async_override = ggml_cuda_ar_env_u64(
+            "GGML_CUDA_AR_ASYNC_SLOTS", std::numeric_limits<uint64_t>::max());
+        const uint64_t async_slots = async_override == std::numeric_limits<uint64_t>::max() ?
+            0 : async_override;
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+            // Record all prior completion dependencies before the slot events
+            // are recorded again. CUDA waits capture the current event record.
+            if (async_slots == 1 || (async_slots == 2 && copy_engine)) {
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                for (int peer = 0; peer < p->n_devices; ++peer) {
+                    CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), p->ev_pool[peer][slot].ker));
+                }
+            } else {
+                CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+            }
         }
     }
 
@@ -693,7 +707,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
     GGML_ASSERT(chunk_bytes > 0);
 
-    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
+    const int slot = ggml_cuda_ar_acquire_slot(p, backends, true).slot;
     const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
     GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
 
@@ -1003,7 +1017,7 @@ bool ggml_cuda_ar_allreduce(
             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
             const size_t chunk_dst_bytes  = chunk_elems * input_type_size;
 
-            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p, backends, false);
             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
 
             ggml_cuda_ar_kernel_peers peers = {};
