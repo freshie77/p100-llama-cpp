@@ -322,6 +322,113 @@ struct server_slot {
 
     server_prompt prompt;
 
+    std::vector<char> pack_prompt_state() const {
+        const auto encoded = prompt.tokens.serialize();
+        std::vector<char> result;
+        size_t total = encoded.size() + 24;
+        for (const auto & checkpoint : prompt.checkpoints) {
+            total += 40 + checkpoint.size();
+        }
+        result.reserve(total + sizeof(llama_token));
+        auto put = [&](const auto & value) {
+            const auto * first = reinterpret_cast<const char *>(&value);
+            result.insert(result.end(), first, first + sizeof(value));
+        };
+        const uint32_t magic = 0x31504743; // CGP1
+        const uint32_t version = 1;
+        const uint64_t prompt_bytes = encoded.size();
+        const uint32_t count = prompt.checkpoints.size();
+        const uint32_t reserved = 0;
+        put(magic); put(version); put(prompt_bytes); put(count); put(reserved);
+        result.insert(result.end(), encoded.begin(), encoded.end());
+        for (const auto & checkpoint : prompt.checkpoints) {
+            put(checkpoint.n_tokens); put(checkpoint.pos_min); put(checkpoint.pos_max);
+            for (const auto * blob : {&checkpoint.data_tgt, &checkpoint.data_dft, &checkpoint.data_spec}) {
+                const uint64_t size = blob->size();
+                put(size);
+            }
+            for (const auto * blob : {&checkpoint.data_tgt, &checkpoint.data_dft, &checkpoint.data_spec}) {
+                if (!blob->empty()) {
+                    const auto * first = reinterpret_cast<const char *>(blob->data());
+                    result.insert(result.end(), first, first + blob->size());
+                }
+            }
+        }
+        while (result.size() % sizeof(llama_token) != 0) {
+            result.push_back(0);
+        }
+        return result;
+    }
+
+    void unpack_prompt_state(const llama_tokens & packed, size_t checkpoint_limit) {
+        const auto * bytes = reinterpret_cast<const uint8_t *>(packed.data());
+        const size_t size = packed.size() * sizeof(llama_token);
+        size_t offset = 0;
+        auto read = [&](void * destination, size_t length) {
+            if (length > size - offset) {
+                throw std::runtime_error("Truncated prompt checkpoint metadata");
+            }
+            std::memcpy(destination, bytes + offset, length);
+            offset += length;
+        };
+        uint32_t magic = 0;
+        read(&magic, sizeof(magic));
+        llama_tokens prompt_packed;
+        std::list<common_prompt_checkpoint> checkpoints;
+        if (magic != 0x31504743) {
+            prompt_packed = packed; // Existing pure prompt/media checkpoint format.
+        } else {
+            uint32_t version = 0, count = 0, reserved = 0;
+            uint64_t prompt_bytes = 0;
+            read(&version, sizeof(version)); read(&prompt_bytes, sizeof(prompt_bytes));
+            read(&count, sizeof(count)); read(&reserved, sizeof(reserved));
+            if (version != 1 || reserved != 0 || count > checkpoint_limit ||
+                prompt_bytes < 2 * sizeof(llama_token) ||
+                prompt_bytes % sizeof(llama_token) != 0 || prompt_bytes > size - offset) {
+                throw std::runtime_error("Invalid prompt checkpoint metadata");
+            }
+            prompt_packed.resize(prompt_bytes / sizeof(llama_token));
+            read(prompt_packed.data(), prompt_bytes);
+            for (uint32_t i = 0; i < count; ++i) {
+                common_prompt_checkpoint checkpoint;
+                read(&checkpoint.n_tokens, sizeof(checkpoint.n_tokens));
+                read(&checkpoint.pos_min, sizeof(checkpoint.pos_min));
+                read(&checkpoint.pos_max, sizeof(checkpoint.pos_max));
+                if (checkpoint.n_tokens < 0 || checkpoint.n_tokens > n_ctx ||
+                    checkpoint.pos_min > checkpoint.pos_max) {
+                    throw std::runtime_error("Invalid recurrent checkpoint positions");
+                }
+                uint64_t sizes[3];
+                for (auto & length : sizes) {
+                    read(&length, sizeof(length));
+                }
+                size_t index = 0;
+                for (auto * blob : {&checkpoint.data_tgt, &checkpoint.data_dft, &checkpoint.data_spec}) {
+                    const uint64_t length = sizes[index++];
+                    if (length > size - offset) {
+                        throw std::runtime_error("Invalid recurrent checkpoint length");
+                    }
+                    blob->resize(length);
+                    if (length != 0) {
+                        read(blob->data(), length);
+                    }
+                }
+                checkpoint.id_task = -1; // A restored checkpoint belongs to no new live request.
+                checkpoints.push_back(std::move(checkpoint));
+            }
+            if (size - offset >= sizeof(llama_token)) {
+                throw std::runtime_error("Unexpected trailing prompt checkpoint metadata");
+            }
+        }
+        auto restored = server_tokens::deserialize(prompt_packed, mctx != nullptr);
+        if (restored.size() > (size_t) n_ctx || !restored.validate(ctx_tgt)) {
+            throw std::runtime_error("Invalid restored prompt tokens or capacity");
+        }
+        prompt.clear();
+        prompt.tokens = std::move(restored);
+        prompt.checkpoints = std::move(checkpoints);
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -729,6 +836,7 @@ struct server_slot {
             {"scheduler_paused", scheduler_paused},
             {"scheduler_suspensions", scheduler_suspensions},
             {"scheduler_resumptions", scheduler_resumptions},
+            {"retained_recurrent_checkpoints", prompt.checkpoints.size()},
             {"scheduling_paused_admission_us", paused_us[0]},
             {"scheduling_paused_prompt_us", paused_us[1]},
             {"scheduling_paused_generation_us", paused_us[2]},
@@ -2560,7 +2668,7 @@ private:
 
                     std::vector<char> packed;
                     try {
-                        packed = slot->prompt.tokens.serialize();
+                        packed = slot->pack_prompt_state();
                     } catch (const std::exception & err) {
                         send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
                         break;
@@ -2622,18 +2730,7 @@ private:
                         }
                         packed.resize(n_packed);
 
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
+                        slot->unpack_prompt_state(packed, std::max(0, params_base.n_ctx_checkpoints));
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -4714,6 +4811,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
             {"cache_type_k", ggml_type_name(params.cache_type_k)},
             {"cache_type_v", ggml_type_name(params.cache_type_v)},
             {"batch", params.n_batch}, {"microbatch", params.n_ubatch},
+            {"checkpoints", params.n_ctx_checkpoints}, {"checkpoint_min_step", params.checkpoint_min_step},
+            {"kv_unified", params.kv_unified},
             {"slot_save_path", params.slot_save_path},
             {"cognitive_scheduler", std::getenv("LLAMA_ARG_COGNITIVE_SCHEDULER") != nullptr},
         } },
