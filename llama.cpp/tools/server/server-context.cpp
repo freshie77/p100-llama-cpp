@@ -4813,6 +4813,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
             {"batch", params.n_batch}, {"microbatch", params.n_ubatch},
             {"checkpoints", params.n_ctx_checkpoints}, {"checkpoint_min_step", params.checkpoint_min_step},
             {"kv_unified", params.kv_unified},
+            {"vision_projector", params.mmproj.path}, {"vision_projector_on_gpu", params.mmproj_use_gpu},
             {"slot_save_path", params.slot_save_path},
             {"cognitive_scheduler", std::getenv("LLAMA_ARG_COGNITIVE_SCHEDULER") != nullptr},
         } },
