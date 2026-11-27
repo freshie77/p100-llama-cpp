@@ -18,6 +18,11 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <array>
+
+#ifndef LLAMA_COGNITIVE_BACKEND_REVISION
+#define LLAMA_COGNITIVE_BACKEND_REVISION "unversioned"
+#endif
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -271,6 +276,21 @@ struct server_slot {
     int64_t scheduler_last_progress = 0;
     int64_t scheduler_suspensions = 0;
     int64_t scheduler_resumptions = 0;
+    std::array<int64_t, 3> scheduling_paused_us = {0, 0, 0};
+    int64_t scheduling_pause_started = 0;
+    int scheduling_pause_phase = 0;
+
+    void update_pause_clock(int64_t now, bool stop = false) {
+        const bool paused = !stop && (inference_paused || scheduler_paused);
+        if (paused && scheduling_pause_started == 0) {
+            scheduling_pause_phase = state == SLOT_STATE_GENERATING ? 2 :
+                (state == SLOT_STATE_PROCESSING_PROMPT || state == SLOT_STATE_DONE_PROMPT ? 1 : 0);
+            scheduling_pause_started = now;
+        } else if (!paused && scheduling_pause_started != 0) {
+            scheduling_paused_us[scheduling_pause_phase] += now - scheduling_pause_started;
+            scheduling_pause_started = 0;
+        }
+    }
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -375,6 +395,7 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+        update_pause_clock(ggml_time_us(), true);
         inference_paused = false;
         scheduler_paused = false;
         scheduler_last_progress = ggml_time_us();
@@ -694,6 +715,10 @@ struct server_slot {
 
     json to_json(bool only_metrics = false) const {
         json res;
+        auto paused_us = scheduling_paused_us;
+        if (scheduling_pause_started != 0) {
+            paused_us[scheduling_pause_phase] += ggml_time_us() - scheduling_pause_started;
+        }
 
         res = {
             {"id",            id},
@@ -704,6 +729,9 @@ struct server_slot {
             {"scheduler_paused", scheduler_paused},
             {"scheduler_suspensions", scheduler_suspensions},
             {"scheduler_resumptions", scheduler_resumptions},
+            {"scheduling_paused_admission_us", paused_us[0]},
+            {"scheduling_paused_prompt_us", paused_us[1]},
+            {"scheduling_paused_generation_us", paused_us[2]},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -2802,6 +2830,9 @@ private:
 
     void update_slots() {
         schedule_cognitive_slots();
+        for (auto & slot : slots) {
+            slot.update_pause_clock(ggml_time_us());
+        }
         const int64_t cognitive_step_start = ggml_time_us();
         const bool cognitive_chat_decode = cognitive_scheduler && slots.size() == 2 &&
             slots[0].state == SLOT_STATE_GENERATING && !slots[0].inference_paused &&
@@ -2898,6 +2929,15 @@ private:
 #endif
 
                 if (ok) {
+                    const int64_t progress_at = ggml_time_us();
+                    for (int i = 0; i < batch_view.n_tokens; ++i) {
+                        for (int j = 0; j < batch_view.n_seq_id[i]; ++j) {
+                            auto * progressed = get_slot_by_id(batch_view.seq_id[i][j]);
+                            if (progressed) {
+                                progressed->scheduler_last_progress = progress_at;
+                            }
+                        }
+                    }
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
@@ -3253,7 +3293,8 @@ private:
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            if (slot.task->n_tokens() > slot.n_ctx ||
+                                (slot.task->n_tokens() == slot.n_ctx && slot.n_predict_max != 0)) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
@@ -3882,6 +3923,18 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                if (slot.n_predict_max == 0) {
+                    llama_synchronize(ctx_tgt);
+                    slot.stats.update_prompt_last();
+                    slot.stats.update_gen_last();
+                    slot.stop = STOP_TYPE_LIMIT;
+                    slot.i_batch = -1;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+                    return;
+                }
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
@@ -4655,6 +4708,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     static const std::string inference_instance = std::to_string(ggml_time_us());
     json props = {
         { "inference_state_instance", inference_instance },
+        { "inference_backend_revision", LLAMA_COGNITIVE_BACKEND_REVISION },
         { "inference_state_configuration", json {
             {"context_per_slot", meta.slot_n_ctx}, {"parallel", params.n_parallel},
             {"cache_type_k", ggml_type_name(params.cache_type_k)},
