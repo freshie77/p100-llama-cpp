@@ -266,6 +266,12 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    bool inference_paused = false;
+    bool scheduler_paused = false;
+    int64_t scheduler_last_progress = 0;
+    int64_t scheduler_suspensions = 0;
+    int64_t scheduler_resumptions = 0;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -369,6 +375,9 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+        inference_paused = false;
+        scheduler_paused = false;
+        scheduler_last_progress = ggml_time_us();
         spec_is_replay = false;
 
         last_nl_pos    = 0;
@@ -691,6 +700,10 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"inference_paused", inference_paused},
+            {"scheduler_paused", scheduler_paused},
+            {"scheduler_suspensions", scheduler_suspensions},
+            {"scheduler_resumptions", scheduler_resumptions},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -2428,7 +2441,10 @@ private:
                         break;
                     }
 
-                    if (task.params.control_action == "reasoning_end") {
+                    if (task.params.control_action == "pause" || task.params.control_action == "resume") {
+                        slot->inference_paused = task.params.control_action == "pause";
+                        res->success = true;
+                    } else if (task.params.control_action == "reasoning_end") {
                         // the budget sampler only exists when reasoning control was armed
                         if (!slot->task->params.sampling.reasoning_control) {
                             res->success = false;
@@ -2682,6 +2698,9 @@ private:
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
+                if (slot.inference_paused || slot.scheduler_paused) {
+                    continue;
+                }
                 callback(slot);
             } catch (const std::exception & e) {
                 SLT_ERR(slot, "got exception: %s\n", e.what());
@@ -2694,6 +2713,9 @@ private:
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
+                if (slot->inference_paused || slot->scheduler_paused) {
+                    continue;
+                }
                 callback(*slot);
             } catch (const std::exception & e) {
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
@@ -2742,7 +2764,45 @@ private:
     };
 #endif
 
+    bool cognitive_scheduler = std::getenv("LLAMA_ARG_COGNITIVE_SCHEDULER") != nullptr;
+    double cognitive_solo_us = 0;
+    double cognitive_parallel_us = 0;
+    int64_t cognitive_retry_at = 0;
+
+    void schedule_cognitive_slots() {
+        if (!cognitive_scheduler || slots.size() != 2) {
+            return;
+        }
+        auto & conversation = slots[0];
+        auto & operation = slots[1];
+        const int64_t now = ggml_time_us();
+        const bool chat_active = conversation.is_processing() && !conversation.inference_paused;
+        const bool both_decoding = chat_active && conversation.state == SLOT_STATE_GENERATING &&
+                                   operation.state == SLOT_STATE_GENERATING;
+        const bool overdue = now - operation.scheduler_last_progress >= 5 * 1000 * 1000;
+        bool concurrent = both_decoding &&
+            (cognitive_solo_us == 0 || cognitive_parallel_us <= cognitive_solo_us * 1.5 ||
+             now >= cognitive_retry_at);
+        const bool pause = chat_active && !concurrent && !overdue;
+        if (operation.scheduler_paused != pause) {
+            if (pause) {
+                ++operation.scheduler_suspensions;
+            } else {
+                ++operation.scheduler_resumptions;
+            }
+            SLT_INF(operation, "cognitive scheduler %s at retained state boundary\n", pause ? "suspended" : "resumed");
+            operation.scheduler_paused = pause;
+        }
+    }
+
     void update_slots() {
+        schedule_cognitive_slots();
+        const int64_t cognitive_step_start = ggml_time_us();
+        const bool cognitive_chat_decode = cognitive_scheduler && slots.size() == 2 &&
+            slots[0].state == SLOT_STATE_GENERATING && !slots[0].inference_paused;
+        const bool cognitive_parallel_decode = cognitive_chat_decode &&
+            slots[1].state == SLOT_STATE_GENERATING && !slots[1].scheduler_paused &&
+            !slots[1].inference_paused;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2761,7 +2821,7 @@ private:
             bool all_idle = true;
 
             for (auto & slot : slots) {
-                if (slot.is_processing()) {
+                if (slot.is_processing() && !slot.inference_paused && !slot.scheduler_paused) {
                     all_idle = false;
                     break;
                 }
@@ -2856,9 +2916,23 @@ private:
                 break; // stop any further processing
             }
         }
+        if (cognitive_chat_decode && batch.size() > 0 && batch.size() <= 2) {
+            const double elapsed = (double) (ggml_time_us() - cognitive_step_start);
+            double & average = cognitive_parallel_decode ? cognitive_parallel_us : cognitive_solo_us;
+            average = average == 0 ? elapsed : average * 0.9 + elapsed * 0.1;
+            if (cognitive_parallel_decode && cognitive_solo_us > 0 &&
+                cognitive_parallel_us > cognitive_solo_us * 1.5) {
+                cognitive_retry_at = ggml_time_us() + 500 * 1000;
+            }
+        }
     }
 
     void pre_decode() {
+        for (auto & slot : slots) {
+            if (slot.is_processing() && !slot.inference_paused && !slot.scheduler_paused) {
+                slot.scheduler_last_progress = ggml_time_us();
+            }
+        }
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -4902,7 +4976,7 @@ void server_routes::init_routes() {
             res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (action != "reasoning_end") {
+        if (action != "reasoning_end" && action != "pause" && action != "resume") {
             res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
