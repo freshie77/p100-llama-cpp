@@ -2767,6 +2767,7 @@ private:
     bool cognitive_scheduler = std::getenv("LLAMA_ARG_COGNITIVE_SCHEDULER") != nullptr;
     double cognitive_solo_us = 0;
     double cognitive_parallel_us = 0;
+    double cognitive_prefill_us_per_token = 0;
     int64_t cognitive_retry_at = 0;
 
     void schedule_cognitive_slots() {
@@ -2779,10 +2780,14 @@ private:
         const bool chat_active = conversation.is_processing() && !conversation.inference_paused;
         const bool both_decoding = chat_active && conversation.state == SLOT_STATE_GENERATING &&
                                    operation.state == SLOT_STATE_GENERATING;
-        const bool overdue = now - operation.scheduler_last_progress >= 5 * 1000 * 1000;
+        const bool overdue = operation.is_processing() && !operation.inference_paused &&
+            now - operation.scheduler_last_progress >= 5 * 1000 * 1000;
         bool concurrent = both_decoding &&
             (cognitive_solo_us == 0 || cognitive_parallel_us <= cognitive_solo_us * 1.5 ||
              now >= cognitive_retry_at);
+        // An aged prefill gets one real batch before conversation resumes.
+        // This is a progress deadline, not a fixed GPU resource partition.
+        conversation.scheduler_paused = chat_active && overdue && !both_decoding;
         const bool pause = chat_active && !concurrent && !overdue;
         if (operation.scheduler_paused != pause) {
             if (pause) {
@@ -2799,7 +2804,8 @@ private:
         schedule_cognitive_slots();
         const int64_t cognitive_step_start = ggml_time_us();
         const bool cognitive_chat_decode = cognitive_scheduler && slots.size() == 2 &&
-            slots[0].state == SLOT_STATE_GENERATING && !slots[0].inference_paused;
+            slots[0].state == SLOT_STATE_GENERATING && !slots[0].inference_paused &&
+            !slots[0].scheduler_paused;
         const bool cognitive_parallel_decode = cognitive_chat_decode &&
             slots[1].state == SLOT_STATE_GENERATING && !slots[1].scheduler_paused &&
             !slots[1].inference_paused;
@@ -2916,6 +2922,21 @@ private:
                 break; // stop any further processing
             }
         }
+        int operation_prompt_tokens = 0;
+        int conversation_tokens = 0;
+        for (const auto & token : batch.tokens) {
+            if (token.id_slot == 0) {
+                ++conversation_tokens;
+            }
+            if (token.id_slot == 1 && token.is_prompt) {
+                ++operation_prompt_tokens;
+            }
+        }
+        if (cognitive_scheduler && operation_prompt_tokens > 0 && conversation_tokens == 0) {
+            const double elapsed_per_token = (double) (ggml_time_us() - cognitive_step_start) / operation_prompt_tokens;
+            cognitive_prefill_us_per_token = cognitive_prefill_us_per_token == 0 ? elapsed_per_token :
+                cognitive_prefill_us_per_token * 0.9 + elapsed_per_token * 0.1;
+        }
         if (cognitive_chat_decode && batch.size() > 0 && batch.size() <= 2) {
             const double elapsed = (double) (ggml_time_us() - cognitive_step_start);
             double & average = cognitive_parallel_decode ? cognitive_parallel_us : cognitive_solo_us;
@@ -2928,11 +2949,6 @@ private:
     }
 
     void pre_decode() {
-        for (auto & slot : slots) {
-            if (slot.is_processing() && !slot.inference_paused && !slot.scheduler_paused) {
-                slot.scheduler_last_progress = ggml_time_us();
-            }
-        }
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3129,6 +3145,13 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        if (cognitive_scheduler && slots.size() == 2 && slots[0].scheduler_paused) {
+            // Use measured decode and prefill costs to bound an aged work quantum.
+            // Idle work keeps the full configured batch and microbatch.
+            const int32_t quantum = cognitive_solo_us > 0 && cognitive_prefill_us_per_token > 0 ?
+                (int32_t) (12 * cognitive_solo_us / cognitive_prefill_us_per_token) : n_ubatch;
+            n_batch = std::max(32, std::min(n_ubatch, quantum));
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3840,6 +3863,7 @@ private:
                 // the required token not in this sub-batch, skip
                 return;
             }
+            slot.scheduler_last_progress = ggml_time_us();
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
@@ -4628,7 +4652,17 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     std::string tmpl_default = common_chat_templates_source(meta.chat_params.tmpls.get(), "");
     std::string tmpl_tools   = common_chat_templates_source(meta.chat_params.tmpls.get(), "tool_use");
 
+    static const std::string inference_instance = std::to_string(ggml_time_us());
     json props = {
+        { "inference_state_instance", inference_instance },
+        { "inference_state_configuration", json {
+            {"context_per_slot", meta.slot_n_ctx}, {"parallel", params.n_parallel},
+            {"cache_type_k", ggml_type_name(params.cache_type_k)},
+            {"cache_type_v", ggml_type_name(params.cache_type_v)},
+            {"batch", params.n_batch}, {"microbatch", params.n_ubatch},
+            {"slot_save_path", params.slot_save_path},
+            {"cognitive_scheduler", std::getenv("LLAMA_ARG_COGNITIVE_SCHEDULER") != nullptr},
+        } },
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
         { "model_alias",                 meta.model_name },
