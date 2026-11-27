@@ -2233,6 +2233,9 @@ private:
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
         res->n_tokens_cached       = slot.prompt.n_tokens();
+        res->cognitive_prefill_complete = slot.prompt.n_tokens() >= slot.task->n_tokens();
+        if (!res->cognitive_prefill_complete && slot.task->params.cognitive_maintenance)
+            res->n_prompt_tokens = slot.prompt.n_tokens();
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
@@ -2895,12 +2898,17 @@ private:
     double cognitive_prefill_us_per_token = 0;
     int64_t cognitive_retry_at = 0;
 
+    int cognitive_foreground_slot() const {
+        return slots.size() == 2 && slots[0].task && slots[0].task->params.cognitive_maintenance &&
+            (!slots[1].task || !slots[1].task->params.cognitive_maintenance) ? 1 : 0;
+    }
+
     void schedule_cognitive_slots() {
         if (!cognitive_scheduler || slots.size() != 2) {
             return;
         }
-        auto & conversation = slots[0];
-        auto & operation = slots[1];
+        auto & conversation = slots[cognitive_foreground_slot()];
+        auto & operation = slots[1-cognitive_foreground_slot()];
         const int64_t now = ggml_time_us();
         const bool chat_active = conversation.is_processing() && !conversation.inference_paused;
         const bool both_decoding = chat_active && conversation.state == SLOT_STATE_GENERATING &&
@@ -2931,12 +2939,14 @@ private:
             slot.update_pause_clock(ggml_time_us());
         }
         const int64_t cognitive_step_start = ggml_time_us();
+        const int foreground = cognitive_foreground_slot();
+        const int background = 1-foreground;
         const bool cognitive_chat_decode = cognitive_scheduler && slots.size() == 2 &&
-            slots[0].state == SLOT_STATE_GENERATING && !slots[0].inference_paused &&
-            !slots[0].scheduler_paused;
+            slots[foreground].state == SLOT_STATE_GENERATING && !slots[foreground].inference_paused &&
+            !slots[foreground].scheduler_paused;
         const bool cognitive_parallel_decode = cognitive_chat_decode &&
-            slots[1].state == SLOT_STATE_GENERATING && !slots[1].scheduler_paused &&
-            !slots[1].inference_paused;
+            slots[background].state == SLOT_STATE_GENERATING && !slots[background].scheduler_paused &&
+            !slots[background].inference_paused;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3059,13 +3069,30 @@ private:
                 break; // stop any further processing
             }
         }
+        // A prefill-only maintenance task may return a retained partial prefix.
+        // This runs after every queued microbatch has completed, including native vision.
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task &&
+                slot.task->params.cognitive_maintenance && slot.n_predict_max == 0 &&
+                slot.task->params.t_max_prompt_ms > 0 &&
+                slot.stats.t_elapsed_us() >= slot.task->params.t_max_prompt_ms * 1000 &&
+                slot.prompt.n_tokens() > slot.stats.n_prompt_cached) {
+                llama_synchronize(ctx_tgt);
+                slot.stats.update_prompt_last();
+                slot.stats.update_gen_last();
+                slot.stop = STOP_TYPE_LIMIT;
+                send_final_response(slot);
+                slot.release();
+                slot.i_batch = -1;
+            }
+        }
         int operation_prompt_tokens = 0;
         int conversation_tokens = 0;
         for (const auto & token : batch.tokens) {
-            if (token.id_slot == 0) {
+            if (token.id_slot == foreground) {
                 ++conversation_tokens;
             }
-            if (token.id_slot == 1 && token.is_prompt) {
+            if (token.id_slot == background && token.is_prompt) {
                 ++operation_prompt_tokens;
             }
         }
@@ -3282,7 +3309,7 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
-        if (cognitive_scheduler && slots.size() == 2 && slots[0].scheduler_paused) {
+        if (cognitive_scheduler && slots.size() == 2 && slots[cognitive_foreground_slot()].scheduler_paused) {
             // Use measured decode and prefill costs to bound an aged work quantum.
             // Idle work keeps the full configured batch and microbatch.
             const int32_t quantum = cognitive_solo_us > 0 && cognitive_prefill_us_per_token > 0 ?
@@ -3292,6 +3319,16 @@ private:
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
+
+        for (const auto & slot : slots) {
+            if (slot.task && slot.task->params.cognitive_maintenance &&
+                slot.task->params.t_max_prompt_ms > 0 && slot.n_predict_max == 0) {
+                // Bound complete microbatches; never expose unevaluated queued tokens.
+                const int32_t measured = cognitive_prefill_us_per_token > 0 ?
+                    (int32_t) (slot.task->params.t_max_prompt_ms * 500.0 / cognitive_prefill_us_per_token) : 256;
+                n_batch = std::min(n_batch, std::min(n_ubatch, std::max(32, measured)));
+            }
+        }
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {

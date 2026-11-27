@@ -53,6 +53,7 @@ struct task_params {
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
+    bool cognitive_maintenance = false; // internal background state preparation
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
@@ -331,6 +332,7 @@ struct server_task_result_cmpl_final : server_task_result {
     int32_t n_prompt_tokens;
     int32_t n_prompt_tokens_cache;
     int32_t n_tokens_cached;
+    bool cognitive_prefill_complete = true;
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;

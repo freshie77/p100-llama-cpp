@@ -34,6 +34,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 
+    add((new field_bool("cognitive_maintenance", params.cognitive_maintenance))
+        ->set_desc("Low-priority state preparation within the existing slots"));
+    add((new field_num("cognitive_prefill_quantum_ms", params.t_max_prompt_ms))
+        ->set_hard_limits(-1, 60000)
+        ->set_desc("Yield prefill-only maintenance at a complete decode boundary"));
+
     add((new field_bool("return_progress", params.return_progress))
         ->set_desc("Include prompt processing progress events in stream mode"));
 
