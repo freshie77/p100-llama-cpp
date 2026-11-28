@@ -36,6 +36,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_bool("cognitive_maintenance", params.cognitive_maintenance))
         ->set_desc("Low-priority state preparation within the existing slots"));
+    add((new field_bool("cognitive_append", params.cognitive_append))
+        ->set_desc("Append exact text token IDs to the specified maintenance slot's retained multimodal prefix"));
+    add((new field_num("cognitive_expected_cached_tokens", params.cognitive_expected_cached_tokens))
+        ->set_hard_limits(-1, INT32_MAX));
+    add((new field_num("cognitive_maintenance_prefill_tps", params.cognitive_maintenance_prefill_tps))
+        ->set_hard_limits(0, 100000));
+    add((new field_num("cognitive_maintenance_decode_tps", params.cognitive_maintenance_decode_tps))
+        ->set_hard_limits(0, 1000));
     add((new field_num("cognitive_prefill_quantum_ms", params.t_max_prompt_ms))
         ->set_hard_limits(-1, 60000)
         ->set_desc("Yield prefill-only maintenance at a complete decode boundary"));

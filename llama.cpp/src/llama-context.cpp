@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3922,6 +3924,12 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_seq_sanitize(llama_memory_t mem, llama_seq_id seq_id) {
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (!hybrid || !hybrid->get_mem_attn()->sanitize_isolated_stream(seq_id)) return false;
+    return mem->seq_rm(seq_id, -1, -1);
 }
 
 void llama_memory_seq_cp(

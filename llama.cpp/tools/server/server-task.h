@@ -54,6 +54,10 @@ struct task_params {
     bool return_tokens   = false;
     bool return_progress = false;
     bool cognitive_maintenance = false; // internal background state preparation
+    bool cognitive_append = false;
+    int32_t cognitive_expected_cached_tokens = -1;
+    double cognitive_maintenance_prefill_tps = 0;
+    double cognitive_maintenance_decode_tps = 0;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 

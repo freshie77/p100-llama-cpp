@@ -273,6 +273,7 @@ struct server_slot {
 
     bool inference_paused = false;
     bool maintenance_yield = false;
+    int64_t cognitive_prefill_deadline_us = 0;
     bool scheduler_paused = false;
     int64_t scheduler_last_progress = 0;
     int64_t scheduler_suspensions = 0;
@@ -1824,6 +1825,27 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (task.params.cognitive_append) {
+            if (!task.params.cognitive_maintenance || task.id_slot < 0 ||
+                task.params.cognitive_expected_cached_tokens < 0 ||
+                task.params.cognitive_expected_cached_tokens != (int32_t) slot.prompt.tokens.size()) {
+                send_error(task, "retained maintenance prefix identity changed", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            const auto tail = task.tokens.get_text_tokens();
+            if (tail.size() != task.tokens.size()) {
+                send_error(task, "append requires exact text token IDs; prefill new media through chat", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            auto combined = slot.prompt.tokens.clone();
+            combined.insert(tail);
+            task.tokens = std::move(combined);
+            task.params.cache_prompt = true;
+        }
+        const auto common = task.params.cache_prompt ? slot.prompt.tokens.get_common_prefix(task.tokens) : 0;
+        const double prefill_cost = cognitive_prefill_us_per_token > 0 ? cognitive_prefill_us_per_token : 1000000.0/835;
+        slot.cognitive_prefill_deadline_us = ggml_time_us() +
+            (int64_t) (std::max<size_t>(1, task.tokens.size()-common) * prefill_cost * 1.5);
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2733,6 +2755,9 @@ private:
 
                     size_t nread = 0;
                     try {
+                        // A shorter restored sequence must not inherit NaNs
+                        // in masked physical padding from its previous tenant.
+                        llama_memory_seq_sanitize(llama_get_memory(ctx_tgt), slot->id);
                         size_t n_packed = 0;
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
@@ -2909,10 +2934,23 @@ private:
     double cognitive_parallel_us = 0;
     double cognitive_prefill_us_per_token = 0;
     int64_t cognitive_retry_at = 0;
+    double cognitive_mixed_prefill_us = 0;
+    double cognitive_burst_prefill_us = 0;
+    double cognitive_maintenance_credit_us = 0;
+    double cognitive_maintenance_token_credit = 0;
+    int64_t cognitive_maintenance_credit_at = 0;
 
     int cognitive_foreground_slot() const {
         return slots.size() == 2 && slots[0].task && slots[0].task->params.cognitive_maintenance &&
             (!slots[1].task || !slots[1].task->params.cognitive_maintenance) ? 1 : 0;
+    }
+
+    bool cognitive_work_maintenance() const {
+        return cognitive_scheduler && slots.size() == 2 && cognitive_foreground_slot() == 1 &&
+            slots[0].task && slots[0].task->params.cognitive_maintenance &&
+            slots[1].is_processing() && !slots[1].inference_paused &&
+            (slots[0].task->params.cognitive_maintenance_prefill_tps > 0 ||
+             slots[0].task->params.cognitive_maintenance_decode_tps > 0);
     }
 
     void schedule_cognitive_slots() {
@@ -2932,8 +2970,9 @@ private:
              now >= cognitive_retry_at);
         // An aged prefill gets one real batch before conversation resumes.
         // This is a progress deadline, not a fixed GPU resource partition.
-        conversation.scheduler_paused = chat_active && overdue && !both_decoding;
-        const bool pause = chat_active && !concurrent && !overdue;
+        const bool shared_work = cognitive_work_maintenance();
+        conversation.scheduler_paused = !shared_work && chat_active && overdue && !both_decoding;
+        const bool pause = !shared_work && chat_active && !concurrent && !overdue;
         if (operation.scheduler_paused != pause) {
             if (pause) {
                 ++operation.scheduler_suspensions;
@@ -2953,6 +2992,8 @@ private:
         const int64_t cognitive_step_start = ggml_time_us();
         const int foreground = cognitive_foreground_slot();
         const int background = 1-foreground;
+        const bool cognitive_shared_maintenance = cognitive_work_maintenance();
+        const bool cognitive_maintenance_decode = cognitive_shared_maintenance && slots[0].state == SLOT_STATE_GENERATING;
         const bool cognitive_chat_decode = cognitive_scheduler && slots.size() == 2 &&
             slots[foreground].state == SLOT_STATE_GENERATING && !slots[foreground].inference_paused &&
             !slots[foreground].scheduler_paused;
@@ -3086,8 +3127,8 @@ private:
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task &&
                 slot.task->params.cognitive_maintenance && slot.n_predict_max == 0 &&
-                slot.task->params.t_max_prompt_ms > 0 &&
-                (slot.maintenance_yield || slot.stats.t_elapsed_us() >= slot.task->params.t_max_prompt_ms * 1000) &&
+                (slot.maintenance_yield || (slot.task->params.t_max_prompt_ms > 0 &&
+                 slot.stats.t_elapsed_us() >= slot.task->params.t_max_prompt_ms * 1000)) &&
                 (uint64_t) slot.prompt.n_tokens() > slot.stats.n_prompt_cached) {
                 llama_synchronize(ctx_tgt);
                 slot.stats.update_prompt_last();
@@ -3108,12 +3149,29 @@ private:
                 ++operation_prompt_tokens;
             }
         }
-        if (cognitive_scheduler && operation_prompt_tokens > 0 && conversation_tokens == 0) {
+        if (cognitive_scheduler && operation_prompt_tokens >= 128 && conversation_tokens == 0) {
             const double elapsed_per_token = (double) (ggml_time_us() - cognitive_step_start) / operation_prompt_tokens;
             cognitive_prefill_us_per_token = cognitive_prefill_us_per_token == 0 ? elapsed_per_token :
                 cognitive_prefill_us_per_token * 0.9 + elapsed_per_token * 0.1;
         }
-        if (cognitive_chat_decode && batch.size() > 0 && batch.size() <= 2) {
+        if (cognitive_shared_maintenance && cognitive_solo_us > 0) {
+            const int prompt_tokens = cognitive_chat_decode ? operation_prompt_tokens :
+                (cognitive_maintenance_decode ? conversation_tokens : 0);
+            if (prompt_tokens > 0) {
+                const double marginal = std::max(1.0,
+                    ((double)(ggml_time_us()-cognitive_step_start)-cognitive_solo_us)/prompt_tokens);
+                cognitive_mixed_prefill_us = cognitive_mixed_prefill_us == 0 ? marginal :
+                    cognitive_mixed_prefill_us*.9+marginal*.1;
+                if (cognitive_chat_decode && operation_prompt_tokens >= 16) {
+                    cognitive_burst_prefill_us = cognitive_burst_prefill_us == 0 ? marginal :
+                        cognitive_burst_prefill_us*.8+marginal*.2;
+                    cognitive_maintenance_credit_us -= std::max(0.0,
+                        (double)(ggml_time_us()-cognitive_step_start)-cognitive_solo_us);
+                }
+            }
+        }
+        if (cognitive_chat_decode && batch.size() > 0 && batch.size() <= 2 &&
+            (cognitive_parallel_decode || operation_prompt_tokens == 0)) {
             const double elapsed = (double) (ggml_time_us() - cognitive_step_start);
             double & average = cognitive_parallel_decode ? cognitive_parallel_us : cognitive_solo_us;
             average = average == 0 ? elapsed : average * 0.9 + elapsed * 0.1;
@@ -3333,7 +3391,8 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         for (const auto & slot : slots) {
-            if (slot.task && slot.task->params.cognitive_maintenance &&
+            if (slot.task && slot.is_processing() && !slot.inference_paused && !slot.scheduler_paused &&
+                slot.task->params.cognitive_maintenance && !cognitive_work_maintenance() &&
                 slot.task->params.t_max_prompt_ms > 0 && slot.n_predict_max == 0) {
                 // Bound complete microbatches; never expose unevaluated queued tokens.
                 const int32_t measured = cognitive_prefill_us_per_token > 0 ?
@@ -3342,12 +3401,76 @@ private:
             }
         }
 
+        int cognitive_normal_limit = n_batch;
+        const bool shared_maintenance = cognitive_work_maintenance();
+        if (shared_maintenance) {
+            // Weights come from remaining work and measured deadlines, not a fixed GPU split.
+            n_batch = std::min(n_batch, n_ubatch);
+            const auto & work = slots[1];
+            const auto & maintenance = slots[0];
+            const double prefill_us = cognitive_mixed_prefill_us > 0 ? cognitive_mixed_prefill_us :
+                (cognitive_prefill_us_per_token > 0 ? cognitive_prefill_us_per_token : 1000000.0/835);
+            const double solo_us = cognitive_solo_us > 0 ? cognitive_solo_us : 20000;
+            if (maintenance.state == SLOT_STATE_GENERATING) {
+                const double rate = maintenance.task->params.cognitive_maintenance_decode_tps;
+                if (rate > 0 && work.state != SLOT_STATE_GENERATING) {
+                    const int budget = (int) std::max(1.0, (1000000.0/rate-solo_us)/prefill_us);
+                    n_batch = std::min(n_batch, (int) batch.size()+budget);
+                }
+                cognitive_normal_limit = n_batch;
+            } else {
+                const int remaining = std::max(1, work.task->n_tokens()-(int)work.prompt.n_tokens());
+                const double seconds = std::max(remaining*prefill_us,
+                    (double)(work.cognitive_prefill_deadline_us-ggml_time_us()))/1000000.0;
+                const double normal_rate = remaining/seconds;
+                const double rate = maintenance.task->params.cognitive_maintenance_prefill_tps;
+                int reserved = (int) (n_batch*rate/std::max(1.0,rate+normal_rate));
+                reserved = std::max(1,std::min(n_batch-1,reserved));
+                if (work.state == SLOT_STATE_GENERATING) {
+                    // Small hybrid prefills have a large fixed launch cost.
+                    // Accumulate measured latency allowance, then process an
+                    // efficient warp-sized burst instead of one token/step.
+                    const int64_t now = ggml_time_us();
+                    const double elapsed = cognitive_maintenance_credit_at ?
+                        std::min(.5, (now-cognitive_maintenance_credit_at)/1000000.0) : solo_us/1000000.0;
+                    cognitive_maintenance_credit_at = now;
+                    const int remaining_prompt = std::max(1,
+                        maintenance.task->n_tokens()-(int)maintenance.prompt.n_tokens());
+                    const int quantum = std::min(32,remaining_prompt);
+                    const double burst_us = cognitive_burst_prefill_us > 0 ?
+                        cognitive_burst_prefill_us :
+                        (cognitive_prefill_us_per_token > 0 ? cognitive_prefill_us_per_token : 1500);
+                    const double estimated_cost = quantum*burst_us;
+                    cognitive_maintenance_credit_us = std::min(estimated_cost*2,
+                        cognitive_maintenance_credit_us+solo_us*.5);
+                    cognitive_maintenance_token_credit = std::min((double)n_ubatch,
+                        cognitive_maintenance_token_credit+rate*elapsed);
+                    reserved = cognitive_maintenance_credit_us >= estimated_cost &&
+                        cognitive_maintenance_token_credit >= quantum ? quantum : 0;
+                    n_batch = std::min(n_batch,(int)batch.size()+reserved);
+                    cognitive_maintenance_token_credit -= reserved;
+                } else {
+                    cognitive_maintenance_credit_us = 0;
+                    cognitive_maintenance_token_credit = 0;
+                    cognitive_maintenance_credit_at = 0;
+                }
+                cognitive_normal_limit = n_batch-reserved;
+            }
+        }
+        std::vector<server_slot *> prefill_order;
+        if (shared_maintenance) {
+            prefill_order = {&slots[1], &slots[0]};
+        } else {
+            for (auto & slot : slots) prefill_order.push_back(&slot);
+        }
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+            iterate(prefill_order, [&](server_slot & slot) {
+                const int slot_batch_limit = shared_maintenance && slot.id == 1 ? cognitive_normal_limit : n_batch;
+                if (!add_ok || batch.size() >= slot_batch_limit) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3520,7 +3643,10 @@ private:
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
                                 }
                             } else {
-                                // if we don't cache the prompt, we have to remove all previous tokens
+                                // Cold initialization clears physical isolated
+                                // storage as well as logical sequence metadata.
+                                if (llama_memory_seq_sanitize(llama_get_memory(ctx_tgt), slot.id))
+                                    slot.prompt_clear();
                                 n_past = 0;
                             }
 
@@ -3757,7 +3883,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < slot_batch_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4051,6 +4177,23 @@ private:
                 return;
             }
             slot.scheduler_last_progress = ggml_time_us();
+
+            // A prefill-only replacement must be numerically valid before it
+            // can be sealed as ready. Also reject corrupt retained inference
+            // before any generated token reaches its caller.
+            if (slot.task->need_sampling() && !slot.can_speculate() &&
+                (slot.state == SLOT_STATE_DONE_PROMPT || slot.state == SLOT_STATE_GENERATING)) {
+                const float * logits = llama_get_logits_ith(slot.ctx_tgt, slot.i_batch - off);
+                if (!logits || !std::all_of(logits, logits + llama_vocab_n_tokens(vocab),
+                        [](float value) { return std::isfinite(value); })) {
+                    // Masked padding may still contain NaNs after metadata
+                    // removal. Clear only this slot's isolated physical stream.
+                    if (llama_memory_seq_sanitize(llama_get_memory(ctx_tgt), slot.id)) {
+                        slot.prompt_clear();
+                    }
+                    throw std::runtime_error("non-finite native inference logits; retained prefix requires rebuilding");
+                }
+            }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
@@ -4533,7 +4676,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (res_type == TASK_RESPONSE_TYPE_NONE && json_value(data, "cognitive_append", false) &&
+            prompt.is_array() && prompt.empty()) {
+            inputs.emplace_back(); // a validated cached prefix is supplied at slot admission
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
@@ -4855,6 +5001,11 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "inference_state_instance", inference_instance },
         { "inference_backend_revision", LLAMA_COGNITIVE_BACKEND_REVISION },
+        { "inference_state_features", json {
+            {"bounded_maintenance", 1}, {"exact_cached_append", 1},
+            {"full_hybrid_rewind_state", 1}, {"numerical_readiness_validation", 1}, {"numerically_safe_recurrent_reset", 1}, {"isolated_numeric_sanitize", 1}, {"sanitized_state_restore", 1},
+            {"deadline_weighted_batching", 1},
+        } },
         { "inference_state_configuration", json {
             {"context_per_slot", meta.slot_n_ctx}, {"parallel", params.n_parallel},
             {"cache_type_k", ggml_type_name(params.cache_type_k)},
