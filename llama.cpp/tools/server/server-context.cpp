@@ -510,6 +510,8 @@ struct server_slot {
         scheduler_paused = false;
         scheduler_last_progress = ggml_time_us();
         spec_is_replay = false;
+        // A released or failed task owns no entry in the next shared batch.
+        i_batch = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -4165,6 +4167,10 @@ private:
         };
 
         iterate(slots, [&](server_slot & slot) {
+            if (!slot.is_processing() || !slot.task) {
+                return;
+            }
+
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
