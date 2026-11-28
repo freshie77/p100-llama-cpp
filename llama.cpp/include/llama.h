@@ -751,6 +751,10 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Clear an isolated sequence's physical KV storage after numerical failure.
+    // Returns false for shared streams; other sequences must remain untouched.
+    LLAMA_API bool llama_memory_seq_sanitize(llama_memory_t mem, llama_seq_id seq_id);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

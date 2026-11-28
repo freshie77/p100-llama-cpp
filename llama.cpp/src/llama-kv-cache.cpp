@@ -380,6 +380,21 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+bool llama_kv_cache::sanitize_isolated_stream(llama_seq_id seq_id) {
+    if (seq_id < 0 || (size_t)seq_id >= seq_to_stream.size()) return false;
+    const uint32_t stream = seq_to_stream[seq_id];
+    for (size_t other_id = 0; other_id < seq_to_stream.size(); ++other_id) {
+        if (other_id != (size_t)seq_id && seq_to_stream[other_id] == stream) return false;
+    }
+    for (auto & layer : layers) {
+        if (auto * tensor = layer.k_stream[stream])
+            ggml_backend_tensor_memset(tensor, 0, 0, ggml_nbytes(tensor));
+        if (auto * tensor = layer.v_stream[stream])
+            ggml_backend_tensor_memset(tensor, 0, 0, ggml_nbytes(tensor));
+    }
+    return true;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

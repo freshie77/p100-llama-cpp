@@ -13,6 +13,16 @@ here=$(cd "$(dirname "$0")" && pwd)
 src=$here/llama.cpp
 jobs=${JOBS:-$(nproc)}
 
+# Rescue2 engineering builds never silently fall back to the root SSD.
+if [[ $(hostname -s) == rescue2 ]]; then
+    /usr/local/sbin/andrew-storage check
+    bulk=/mnt/archive-disks/disk13/andrew-runtime-storage/engineering
+    export TMPDIR="$bulk/tmp"
+    build_dir=${BUILD_DIR:-$bulk/builds/p100-llama-cpp-$(git -C "$here" rev-parse --short HEAD)}
+else
+    build_dir=${BUILD_DIR:-$src/build}
+fi
+
 die() { echo "build.sh: $*" >&2; exit 1; }
 
 # Default to the installed GPUs' own architectures. A plain sm_60 build still RUNS
@@ -39,13 +49,13 @@ else
     echo "build.sh: gcc-13 not found, using the default compiler (CUDA 12.4 needs gcc <= 13)" >&2
 fi
 
-cmake -S "$src" -B "$src/build" \
+cmake -S "$src" -B "$build_dir" \
     -DGGML_CUDA=ON \
     -DCMAKE_CUDA_ARCHITECTURES="$arch" \
     -DCMAKE_BUILD_TYPE=Release \
     "${compilers[@]}"
-cmake --build "$src/build" -j "$jobs"
+cmake --build "$build_dir" -j "$jobs"
 
 echo
-echo "Built: $src/build/bin/"
-"$src/build/bin/llama-server" --list-devices || true
+echo "Built: $build_dir/bin/"
+"$build_dir/bin/llama-server" --list-devices || true

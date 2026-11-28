@@ -354,6 +354,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stop_type",           stop_type_to_str(stop)},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
+        {"cognitive_prefill_complete", cognitive_prefill_complete},
         {"timings",             stats.to_json()},
     };
     if (!stream && !probs_output.empty()) {
@@ -444,6 +445,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"model",              oaicompat_model},
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion"},
+        {"cognitive_prefill_complete", cognitive_prefill_complete},
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
     };
