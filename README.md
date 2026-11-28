@@ -1,5 +1,7 @@
 # Faster llama.cpp decode on the Tesla P100 (GP100, sm_60)
 
+The accepted rescue2 native bundle remains incremental-20/source `44aa03b`; see [rolling RAM acceptance and storage defaults](docs/rolling-ram-native-acceptance-20261128.md). Rescue2 engineering builds verify bulk storage and use dedicated large-drive output locations.
+
 ## Quick start
 
 This repo ships a ready-to-build llama.cpp with every patch already applied:
